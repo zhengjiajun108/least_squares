@@ -12,6 +12,7 @@
                 "${workspaceFolder}\\main.cpp",
                 "${workspaceFolder}\\UniformLineFit.cpp",
                 "${workspaceFolder}\\OrthogonalLineFit.cpp",
+                "${workspaceFolder}\\XlsxReader.cpp",
                 "-o",
                 "${workspaceFolder}\\least_squares.exe"
             ],
