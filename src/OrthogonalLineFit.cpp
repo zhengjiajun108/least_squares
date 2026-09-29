@@ -1,3 +1,4 @@
+// 分步优化，正交距离回归
 #include "LineFit.h"
 
 #include <cmath>
