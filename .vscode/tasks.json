@@ -17,6 +17,7 @@
                 "${workspaceFolder}\\src\\LineFitPipeline.cpp",
                 "${workspaceFolder}\\src\\PlaneFitPipeline.cpp",
                 "${workspaceFolder}\\src\\SvdPlaneFit.cpp",
+                "${workspaceFolder}\\src\\SortUtils.cpp",
                 "-o",
                 "${workspaceFolder}\\least_squares.exe"
             ],

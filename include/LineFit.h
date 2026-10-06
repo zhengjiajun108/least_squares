@@ -22,4 +22,9 @@ LineFitResult uniformLineFit(const std::vector<double>& x,
 LineFitResult orthogonalLineFit(const std::vector<double>& x,
                              const std::vector<double>& y);
 
+// 正交距离回归(TLS)：定方向后直接计算各点到直线的垂直距离残差，不做均匀分布约束。
+// 仅填 k、b、residual(垂直距离)、sse(垂直距离平方和)；Xb/d/xFit/yFit 不填。
+LineFitResult orthogonalFitResidual(const std::vector<double>& x,
+                                    const std::vector<double>& y);
+
 #endif
