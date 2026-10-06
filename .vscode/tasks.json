@@ -15,6 +15,7 @@
                 "${workspaceFolder}\\src\\OrthogonalLineFit.cpp",
                 "${workspaceFolder}\\src\\XlsxReader.cpp",
                 "${workspaceFolder}\\src\\LineFitPipeline.cpp",
+                "${workspaceFolder}\\src\\PlaneFitPipeline.cpp",
                 "${workspaceFolder}\\src\\SvdPlaneFit.cpp",
                 "-o",
                 "${workspaceFolder}\\least_squares.exe"
