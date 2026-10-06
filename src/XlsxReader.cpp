@@ -458,15 +458,18 @@ std::map<int, std::map<int, Cell>> parseSheet(
         const std::size_t c = xml.find("<c ", pos);
         if (c == std::string::npos)
             break;
-        const std::size_t endClose = xml.find("</c>", c);
-        const std::size_t endSelf = xml.find("/>", c);
+        // 先定位 <c ...> 起始标签的结束位置，据其是否以 "/" 结尾判断单元格是否自闭合，
+        // 避免把单元格内部的 <f .../> 误当作单元格结束而丢掉后面的 <v>
+        const std::size_t tagEnd = xml.find('>', c);
+        if (tagEnd == std::string::npos)
+            break;
         std::size_t end;
         std::size_t next;
-        if (endSelf != std::string::npos &&
-            (endClose == std::string::npos || endSelf < endClose)) {
-            end = endSelf;
-            next = endSelf + 2;
+        if (tagEnd > c && xml[tagEnd - 1] == '/') {
+            end = tagEnd - 1;
+            next = tagEnd + 1;
         } else {
+            const std::size_t endClose = xml.find("</c>", tagEnd);
             if (endClose == std::string::npos)
                 break;
             end = endClose;
