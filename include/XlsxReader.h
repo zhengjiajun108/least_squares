@@ -14,9 +14,10 @@ void readPointsFromXlsx(const std::string& path,
                         std::vector<double>& x,
                         std::vector<double>& y);
 
-// 将若干列数据写入(或覆盖)指定工作表：第 1 行为列头(内联字符串)，
-// 之后每一行为各列对应的数据。若工作表不存在则自动创建。
-// 原地修改 xlsx 文件，原有其它工作表/图表等保持不变。
+// 按列名向指定工作表追加数据：在表头行按 headers 中的名称定位列，
+// 找不到的列在表头行最右侧新建；各列数据追加到其已有数据末尾
+// (多列共用同一公共起始行以保持对齐)。保留该工作表其它单元格与其它工作表，
+// 原地修改 xlsx 文件。headers 与 columns 数量须一致，各数据列长度须一致。
 void writeColumnsToXlsx(const std::string& path,
                         const std::string& sheetName,
                         const std::vector<std::string>& headers,

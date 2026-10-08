@@ -180,13 +180,15 @@ int fixed(Inflater& s) {
         lengths[symbol] = 7;
     for (; symbol < kFixLcodes; ++symbol)
         lengths[symbol] = 8;
+    // 固定表是合法的：construct 对不完整码表(定长距离码)会返回正的 left，
+    // 这里只需在负值(过订)时才报错，其余情况忽略返回值。
     int err = construct(lencode, lengths, kFixLcodes);
-    if (err)
+    if (err < 0)
         return err;
     for (symbol = 0; symbol < kMaxDcodes; ++symbol)
         lengths[symbol] = 5;
     err = construct(distcode, lengths, kMaxDcodes);
-    if (err)
+    if (err < 0)
         return err;
     return codes(s, lencode, distcode);
 }
@@ -254,9 +256,13 @@ int dynamic(Inflater& s) {
     return codes(s, lencode, distcode);
 }
 
-std::vector<uint8_t> inflate(const std::vector<uint8_t>& in) {
+std::vector<uint8_t> inflate(const std::vector<uint8_t>& in,
+                             std::size_t uncompSizeHint = 0) {
     Inflater s{in.data(), in.size(), 0, 0, 0, nullptr};
     std::vector<uint8_t> out;
+    // 按中央目录记录的未压缩大小预分配，避免逐字节扩容
+    if (uncompSizeHint > 0)
+        out.reserve(uncompSizeHint);
     s.out = &out;
     int last;
     do {
@@ -272,12 +278,156 @@ std::vector<uint8_t> inflate(const std::vector<uint8_t>& in) {
     return out;
 }
 
+// ---------------------- DEFLATE (deflate) ----------------------
+// 仅使用固定 Huffman 码 + 贪心 LZ77 匹配，输出原始(无 zlib 头) deflate 流。
+// 目标是把 xlsx 内文本(XML)压得比 stored 小，且实现足够简单可靠。
+
+struct BitWriter {
+    std::vector<uint8_t>& out;
+    uint32_t bitbuf;
+    int bitcnt;
+
+    explicit BitWriter(std::vector<uint8_t>& o)
+        : out(o), bitbuf(0), bitcnt(0) {}
+
+    // 写入 nbits 位原始整数(LSB-first)，用于额外位
+    void put(uint32_t value, int nbits) {
+        bitbuf |= (value & ((1u << nbits) - 1u)) << bitcnt;
+        bitcnt += nbits;
+        while (bitcnt >= 8) {
+            out.push_back(static_cast<uint8_t>(bitbuf & 0xFF));
+            bitbuf >>= 8;
+            bitcnt -= 8;
+        }
+    }
+
+    // 写入 Huffman 码(MSB-first)
+    void putHuff(uint32_t code, int nbits) {
+        for (int i = nbits - 1; i >= 0; --i)
+            put((code >> i) & 1u, 1);
+    }
+
+    void flush() {
+        if (bitcnt > 0) {
+            out.push_back(static_cast<uint8_t>(bitbuf & 0xFF));
+            bitbuf = 0;
+            bitcnt = 0;
+        }
+    }
+};
+
+// 固定 Huffman 表中的 literal/length 码
+void emitLitLen(BitWriter& w, int sym) {
+    if (sym <= 143)
+        w.putHuff(static_cast<uint32_t>(0x30 + sym), 8);
+    else if (sym <= 255)
+        w.putHuff(static_cast<uint32_t>(0x190 + (sym - 144)), 9);
+    else if (sym <= 279)
+        w.putHuff(static_cast<uint32_t>(sym - 256), 7);
+    else
+        w.putHuff(static_cast<uint32_t>(0xC0 + (sym - 280)), 8);
+}
+
+void emitMatch(BitWriter& w, int len, int dist) {
+    int lsym = 0;
+    for (int i = 28; i >= 0; --i)
+        if (len >= kLens[i]) {
+            lsym = i;
+            break;
+        }
+    emitLitLen(w, 257 + lsym);
+    w.put(static_cast<uint32_t>(len - kLens[lsym]), kLext[lsym]);
+
+    int dsym = 0;
+    for (int i = 29; i >= 0; --i)
+        if (dist >= kDists[i]) {
+            dsym = i;
+            break;
+        }
+    w.putHuff(static_cast<uint32_t>(dsym), 5);
+    w.put(static_cast<uint32_t>(dist - kDists[dsym]), kDext[dsym]);
+}
+
+std::vector<uint8_t> deflate(const std::vector<uint8_t>& in) {
+    std::vector<uint8_t> out;
+    out.reserve(in.size() / 2 + 16);
+    BitWriter w(out);
+    w.put(1, 1);  // BFINAL = 1
+    w.put(1, 2);  // BTYPE  = 01 (fixed Huffman)
+
+    const size_t n = in.size();
+    const int kHashBits = 15;
+    const int kHashSize = 1 << kHashBits;
+    std::vector<int> head(static_cast<std::size_t>(kHashSize), -1);
+    std::vector<int> prev(n, -1);
+
+    auto hash3 = [&in](std::size_t p) -> int {
+        uint32_t h = static_cast<uint32_t>(in[p]) |
+                     (static_cast<uint32_t>(in[p + 1]) << 8) |
+                     (static_cast<uint32_t>(in[p + 2]) << 16);
+        h *= 2654435761u;
+        return static_cast<int>(h >> (32 - kHashBits));
+    };
+
+    std::size_t i = 0;
+    while (i < n) {
+        int bestLen = 0;
+        int bestDist = 0;
+        if (i + 3 <= n) {
+            const int h = hash3(i);
+            int cand = head[h];
+            int chain = 0;
+            const int kMaxChain = 128;
+            std::size_t maxLen = n - i;
+            if (maxLen > 258)
+                maxLen = 258;
+            while (cand >= 0 && chain++ < kMaxChain &&
+                   static_cast<int>(i) - cand <= 32768) {
+                std::size_t l = 0;
+                while (l < maxLen && in[static_cast<std::size_t>(cand) + l] ==
+                                          in[i + l])
+                    ++l;
+                if (static_cast<int>(l) > bestLen) {
+                    bestLen = static_cast<int>(l);
+                    bestDist = static_cast<int>(i) - cand;
+                    if (l >= maxLen)
+                        break;
+                }
+                cand = prev[static_cast<std::size_t>(cand)];
+            }
+            prev[i] = head[h];
+            head[h] = static_cast<int>(i);
+        }
+
+        if (bestLen >= 3) {
+            emitMatch(w, bestLen, bestDist);
+            for (int k = 1; k < bestLen; ++k) {
+                const std::size_t p = i + static_cast<std::size_t>(k);
+                if (p + 3 <= n) {
+                    const int hh = hash3(p);
+                    prev[p] = head[hh];
+                    head[hh] = static_cast<int>(p);
+                }
+            }
+            i += static_cast<std::size_t>(bestLen);
+        } else {
+            emitLitLen(w, in[i]);
+            ++i;
+        }
+    }
+    emitLitLen(w, 256);  // end of block
+    w.flush();
+    return out;
+}
+
 // ---------------------- ZIP 解析 ----------------------
 
 struct ZipEntry {
     std::string name;
     uint16_t method;
-    uint32_t compSize;
+    uint32_t crc;
+    uint32_t compSize;    // 压缩后大小(数据区字节数)
+    uint32_t uncompSize;  // 解压后大小
     uint32_t localOffset;
 };
 
@@ -305,7 +455,9 @@ std::vector<ZipEntry> readCentralDirectory(const std::vector<uint8_t>& d) {
             break;
         ZipEntry e;
         e.method = le16(&d[p + 10]);
+        e.crc = le32(&d[p + 16]);
         e.compSize = le32(&d[p + 20]);
+        e.uncompSize = le32(&d[p + 24]);
         const uint16_t nameLen = le16(&d[p + 28]);
         const uint16_t extraLen = le16(&d[p + 30]);
         const uint16_t commentLen = le16(&d[p + 32]);
@@ -332,7 +484,7 @@ std::vector<uint8_t> extractEntry(const std::vector<uint8_t>& d,
     if (e.method == 0)
         return raw;
     if (e.method == 8)
-        return inflate(raw);
+        return inflate(raw, e.uncompSize);
     throw std::runtime_error("unsupported zip compression method");
 }
 
@@ -449,13 +601,91 @@ std::vector<std::string> parseSharedStrings(const std::string& xml) {
     return shared;
 }
 
+// 定位下一个单元格起始(<c ...> / <c> / <c/>)，
+// 只认标签名恰为 "c" 的位置，避免命中 <conditionalFormatting 等以 c 开头的标签。
+std::size_t findCellStart(const std::string& s, std::size_t from) {
+    std::size_t p = from;
+    while ((p = s.find("<c", p)) != std::string::npos) {
+        const char n = (p + 2 < s.size()) ? s[p + 2] : '\0';
+        if (n == ' ' || n == '>' || n == '/' || n == '\t' || n == '\n' ||
+            n == '\r')
+            return p;
+        p += 2;
+    }
+    return std::string::npos;
+}
+
+// 从引用串(如 B3 / $B$3)解析行列号，行列均 1 起始
+bool parseRef(const std::string& ref, int& row, int& col) {
+    row = 0;
+    col = 0;
+    for (const char ch : ref) {
+        if (ch == '$')
+            continue;
+        if (ch >= 'A' && ch <= 'Z')
+            col = col * 26 + (ch - 'A' + 1);
+        else if (ch >= 'a' && ch <= 'z')
+            col = col * 26 + (ch - 'a' + 1);
+        else if (ch >= '0' && ch <= '9')
+            row = row * 10 + (ch - '0');
+    }
+    return col > 0 && row > 0;
+}
+
+// 把一个单元格 XML 解码为 Cell(内联串/共享串/公式串/布尔/错误/数值)
+Cell decodeCell(const std::string& cell, const std::vector<std::string>& shared) {
+    Cell value;
+    if (cell.find("t=\"inlineStr\"") != std::string::npos) {
+        value.hasValue = true;
+        value.isString = true;
+        value.text = extractText(cell);
+    } else if (cell.find("t=\"s\"") != std::string::npos) {
+        const std::string v = extractRawV(cell);
+        if (!v.empty()) {
+            try {
+                const std::size_t idx =
+                    static_cast<std::size_t>(std::stoul(v));
+                if (idx < shared.size()) {
+                    value.hasValue = true;
+                    value.isString = true;
+                    value.text = shared[idx];
+                }
+            } catch (...) {
+            }
+        }
+    } else if (cell.find("t=\"str\"") != std::string::npos) {
+        value.hasValue = true;
+        value.isString = true;
+        value.text = unescapeXml(extractRawV(cell));
+    } else if (cell.find("t=\"b\"") != std::string::npos) {
+        const std::string v = extractRawV(cell);
+        if (!v.empty()) {
+            value.hasValue = true;
+            value.isString = false;
+            value.number = (v == "1") ? 1.0 : 0.0;
+        }
+    } else if (cell.find("t=\"e\"") != std::string::npos) {
+        // 错误值，忽略
+    } else {
+        const std::string v = extractRawV(cell);
+        if (!v.empty()) {
+            try {
+                value.number = std::stod(v);
+                value.hasValue = true;
+            } catch (...) {
+            }
+        }
+    }
+    return value;
+}
+
 // 解析工作表: 返回 cells[行][列] = Cell，行列均为 1 起始
 std::map<int, std::map<int, Cell>> parseSheet(
     const std::string& xml, const std::vector<std::string>& shared) {
     std::map<int, std::map<int, Cell>> cells;
     std::size_t pos = 0;
     for (;;) {
-        const std::size_t c = xml.find("<c ", pos);
+        const std::size_t c = findCellStart(xml, pos);
         if (c == std::string::npos)
             break;
         // 先定位 <c ...> 起始标签的结束位置，据其是否以 "/" 结尾判断单元格是否自闭合，
@@ -482,42 +712,12 @@ std::map<int, std::map<int, Cell>> parseSheet(
         if (ref.empty())
             continue;
 
-        int col = 0;
         int row = 0;
-        for (const char ch : ref) {
-            if (ch >= 'A' && ch <= 'Z')
-                col = col * 26 + (ch - 'A' + 1);
-            else if (ch >= '0' && ch <= '9')
-                row = row * 10 + (ch - '0');
-        }
+        int col = 0;
+        if (!parseRef(ref, row, col))
+            continue;
 
-        Cell value;
-        if (cell.find("t=\"inlineStr\"") != std::string::npos) {
-            value.hasValue = true;
-            value.isString = true;
-            value.text = extractText(cell);
-        } else if (cell.find("t=\"s\"") != std::string::npos) {
-            const std::string v = extractRawV(cell);
-            if (!v.empty()) {
-                const std::size_t idx = static_cast<std::size_t>(std::stoul(v));
-                value.hasValue = true;
-                value.isString = true;
-                if (idx < shared.size())
-                    value.text = shared[idx];
-            }
-        } else if (cell.find("t=\"str\"") != std::string::npos) {
-            value.hasValue = true;
-            value.isString = true;
-            value.text = unescapeXml(extractRawV(cell));
-        } else {
-            const std::string v = extractRawV(cell);
-            if (!v.empty()) {
-                value.hasValue = true;
-                value.isString = false;
-                value.number = std::stod(v);
-            }
-        }
-
+        Cell value = decodeCell(cell, shared);
         if (value.hasValue)
             cells[row][col] = value;
     }
@@ -584,7 +784,16 @@ std::string resolveSheetPath(const std::vector<uint8_t>& data,
 
 // ---------------------- 写出 (ZIP / worksheet) ----------------------
 
-using PartList = std::vector<std::pair<std::string, std::vector<uint8_t>>>;
+// 一个待写出的 zip 部件。未修改的部件保留其原始压缩字节与 method，
+// 只有被重建的部件才重新压缩/存储。
+struct OutPart {
+    std::string name;
+    uint16_t method = 0;        // 0 stored, 8 deflate
+    uint32_t crc = 0;           // 未压缩数据的 crc32
+    uint32_t compSize = 0;      // data 中的字节数
+    uint32_t uncompSize = 0;
+    std::vector<uint8_t> data;  // 实际写入 zip 的字节(已压缩或原样)
+};
 
 uint32_t crc32(const uint8_t* data, std::size_t len) {
     uint32_t crc = 0xFFFFFFFFu;
@@ -628,40 +837,6 @@ std::string formatNumber(double v) {
     return os.str();
 }
 
-std::string buildSheetXml(const std::vector<std::string>& headers,
-                          const std::vector<std::vector<double>>& columns) {
-    std::string xml =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-        "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/"
-        "2006/main\"><sheetData>";
-
-    xml += "<row r=\"1\">";
-    for (std::size_t c = 0; c < headers.size(); ++c) {
-        const std::string ref = colName(static_cast<int>(c) + 1) + "1";
-        xml += "<c r=\"" + ref + "\" t=\"inlineStr\"><is><t>" +
-               escapeXml(headers[c]) + "</t></is></c>";
-    }
-    xml += "</row>";
-
-    std::size_t rows = 0;
-    for (const auto& col : columns)
-        rows = std::max(rows, col.size());
-    for (std::size_t r = 0; r < rows; ++r) {
-        xml += "<row r=\"" + std::to_string(r + 2) + "\">";
-        for (std::size_t c = 0; c < columns.size(); ++c) {
-            if (r >= columns[c].size())
-                continue;
-            const std::string ref =
-                colName(static_cast<int>(c) + 1) + std::to_string(r + 2);
-            xml += "<c r=\"" + ref + "\"><v>" + formatNumber(columns[c][r]) +
-                   "</v></c>";
-        }
-        xml += "</row>";
-    }
-    xml += "</sheetData></worksheet>";
-    return xml;
-}
-
 void appendLe16(std::vector<uint8_t>& b, uint16_t v) {
     b.push_back(static_cast<uint8_t>(v & 0xff));
     b.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
@@ -678,37 +853,83 @@ std::vector<uint8_t> toBytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-// 以不压缩(stored)方式写出 zip
-void writeZip(const std::string& path, const PartList& parts) {
+std::string bytesToString(const std::vector<uint8_t>& b) {
+    return std::string(b.begin(), b.end());
+}
+
+// 从完整 zip 数据中取出某条目未经解压的原始字节(用于原样保留)
+std::vector<uint8_t> rawEntryBytes(const std::vector<uint8_t>& d,
+                                   const ZipEntry& e) {
+    const std::size_t p = e.localOffset;
+    if (p + 30 > d.size() || le32(&d[p]) != 0x04034b50u)
+        throw std::runtime_error("bad local file header");
+    const uint16_t nameLen = le16(&d[p + 26]);
+    const uint16_t extraLen = le16(&d[p + 28]);
+    const std::size_t dataOff = p + 30 + nameLen + extraLen;
+    if (dataOff + e.compSize > d.size())
+        throw std::runtime_error("zip data out of range");
+    return std::vector<uint8_t>(d.begin() + dataOff,
+                                d.begin() + dataOff + e.compSize);
+}
+
+// 压缩内容；若压缩后反而更大则退回 stored
+OutPart makeDeflated(const std::string& name, const std::string& content) {
+    const std::vector<uint8_t> raw = toBytes(content);
+    OutPart p;
+    p.name = name;
+    p.uncompSize = static_cast<uint32_t>(raw.size());
+    p.crc = crc32(raw.data(), raw.size());
+    const std::vector<uint8_t> comp = deflate(raw);
+    if (comp.size() < raw.size()) {
+        p.method = 8;
+        p.data = comp;
+    } else {
+        p.method = 0;
+        p.data = raw;
+    }
+    p.compSize = static_cast<uint32_t>(p.data.size());
+    return p;
+}
+
+// 取部件未压缩内容
+std::string partText(const OutPart& p) {
+    if (p.method == 0)
+        return bytesToString(p.data);
+    if (p.method == 8)
+        return bytesToString(inflate(p.data, p.uncompSize));
+    throw std::runtime_error("unsupported method in part");
+}
+
+// 按各部件自身的压缩方式写出 zip
+void writeZip(const std::string& path, const std::vector<OutPart>& parts) {
     struct Central {
         std::string name;
+        uint16_t method;
         uint32_t crc;
-        uint32_t size;
+        uint32_t comp;
+        uint32_t uncomp;
         uint32_t offset;
     };
     std::vector<uint8_t> out;
     std::vector<Central> central;
 
     for (const auto& part : parts) {
-        Central c;
-        c.name = part.first;
-        c.crc = crc32(part.second.data(), part.second.size());
-        c.size = static_cast<uint32_t>(part.second.size());
-        c.offset = static_cast<uint32_t>(out.size());
+        Central c{part.name, part.method, part.crc, part.compSize,
+                  part.uncompSize, static_cast<uint32_t>(out.size())};
 
         appendLe32(out, 0x04034b50u);
         appendLe16(out, 20);
         appendLe16(out, 0);
-        appendLe16(out, 0);     // stored
+        appendLe16(out, part.method);
         appendLe16(out, 0);     // time
         appendLe16(out, 0x21);  // date (1980-01-01)
-        appendLe32(out, c.crc);
-        appendLe32(out, c.size);
-        appendLe32(out, c.size);
-        appendLe16(out, static_cast<uint16_t>(c.name.size()));
+        appendLe32(out, part.crc);
+        appendLe32(out, part.compSize);
+        appendLe32(out, part.uncompSize);
+        appendLe16(out, static_cast<uint16_t>(part.name.size()));
         appendLe16(out, 0);
-        out.insert(out.end(), c.name.begin(), c.name.end());
-        out.insert(out.end(), part.second.begin(), part.second.end());
+        out.insert(out.end(), part.name.begin(), part.name.end());
+        out.insert(out.end(), part.data.begin(), part.data.end());
         central.push_back(c);
     }
 
@@ -718,12 +939,12 @@ void writeZip(const std::string& path, const PartList& parts) {
         appendLe16(out, 20);
         appendLe16(out, 20);
         appendLe16(out, 0);
-        appendLe16(out, 0);
+        appendLe16(out, c.method);
         appendLe16(out, 0);
         appendLe16(out, 0x21);
         appendLe32(out, c.crc);
-        appendLe32(out, c.size);
-        appendLe32(out, c.size);
+        appendLe32(out, c.comp);
+        appendLe32(out, c.uncomp);
         appendLe16(out, static_cast<uint16_t>(c.name.size()));
         appendLe16(out, 0);
         appendLe16(out, 0);
@@ -751,130 +972,339 @@ void writeZip(const std::string& path, const PartList& parts) {
             static_cast<std::streamsize>(out.size()));
 }
 
-PartList::iterator findPart(PartList& parts, const std::string& name) {
-    for (auto it = parts.begin(); it != parts.end(); ++it)
-        if (it->first == name)
-            return it;
-    return parts.end();
-}
-
-PartList buildEmptyPackage() {
-    PartList parts;
-    parts.emplace_back(
+std::vector<OutPart> buildEmptyPackage() {
+    std::vector<OutPart> parts;
+    parts.push_back(makeDeflated(
         "[Content_Types].xml",
-        toBytes("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/"
-                "content-types\"><Default Extension=\"rels\" "
-                "ContentType=\"application/vnd.openxmlformats-package."
-                "relationships+xml\"/><Default Extension=\"xml\" "
-                "ContentType=\"application/xml\"/><Override "
-                "PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd."
-                "openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
-                "</Types>"));
-    parts.emplace_back(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/"
+        "content-types\"><Default Extension=\"rels\" "
+        "ContentType=\"application/vnd.openxmlformats-package."
+        "relationships+xml\"/><Default Extension=\"xml\" "
+        "ContentType=\"application/xml\"/><Override "
+        "PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd."
+        "openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
+        "</Types>"));
+    parts.push_back(makeDeflated(
         "_rels/.rels",
-        toBytes("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                "<Relationships xmlns=\"http://schemas.openxmlformats.org/"
-                "package/2006/relationships\"><Relationship Id=\"rId1\" "
-                "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/"
-                "relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
-                "</Relationships>"));
-    parts.emplace_back(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/relationships\"><Relationship Id=\"rId1\" "
+        "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/"
+        "relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
+        "</Relationships>"));
+    parts.push_back(makeDeflated(
         "xl/workbook.xml",
-        toBytes(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-            "<workbook xmlns=\"http://schemas.openxmlformats.org/"
-            "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats."
-            "org/officeDocument/2006/relationships\"><sheets></sheets>"
-            "</workbook>"));
-    parts.emplace_back(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/"
+        "spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats."
+        "org/officeDocument/2006/relationships\"><sheets></sheets>"
+        "</workbook>"));
+    parts.push_back(makeDeflated(
         "xl/_rels/workbook.xml.rels",
-        toBytes("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                "<Relationships xmlns=\"http://schemas.openxmlformats.org/"
-                "package/2006/relationships\"></Relationships>"));
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/"
+        "package/2006/relationships\"></Relationships>"));
     return parts;
 }
 
-// 在 parts 中新增或覆盖指定工作表，并同步 workbook / rels / content-types
-void upsertSheet(PartList& parts, const std::string& sheetName,
-                 const std::string& sheetXml) {
-    auto wbIt = findPart(parts, "xl/workbook.xml");
-    auto relIt = findPart(parts, "xl/_rels/workbook.xml.rels");
-    auto ctIt = findPart(parts, "[Content_Types].xml");
-    if (wbIt == parts.end() || relIt == parts.end())
-        throw std::runtime_error("workbook parts missing");
-
-    const std::string wb = toString(wbIt->second);
-    const std::string rels = toString(relIt->second);
-
-    std::string rid;
-    std::size_t p = 0;
-    for (;;) {
-        const std::size_t s = wb.find("<sheet ", p);
-        if (s == std::string::npos)
-            break;
-        const std::size_t e = wb.find('>', s);
-        if (e == std::string::npos)
-            break;
-        const std::string el = wb.substr(s, e - s);
-        if (getAttr(el, "name") == sheetName) {
-            rid = getAttr(el, "r:id");
-            break;
+void replacePart(std::vector<OutPart>& parts, const std::string& name,
+                 const OutPart& np) {
+    for (auto& p : parts)
+        if (p.name == name) {
+            p = np;
+            return;
         }
-        p = e + 1;
+    parts.push_back(np);
+}
+
+// ---------------------- 工作表增量修补 ----------------------
+
+struct RawCell {
+    std::string raw;  // 原始 <c ...>...</c> 或 <c .../>
+    Cell value;
+};
+
+struct RawRow {
+    std::string openTag;  // 原始 <row ...>；合成行为空串
+    bool selfClosed = false;
+    std::map<int, RawCell> cells;
+};
+
+struct RawSheet {
+    bool hasSheetData = false;
+    std::string prefix;  // <sheetData ...> 之前
+    std::string suffix;  // </sheetData> 之后
+    std::map<int, RawRow> rows;
+};
+
+RawSheet parseRawSheet(const std::string& xml,
+                       const std::vector<std::string>& shared) {
+    RawSheet rs;
+    const std::size_t sd = xml.find("<sheetData");
+    if (sd == std::string::npos)
+        return rs;
+    const std::size_t sdEnd = xml.find('>', sd);
+    if (sdEnd == std::string::npos)
+        return rs;
+    rs.hasSheetData = true;
+    rs.prefix = xml.substr(0, sd);
+
+    const bool sdSelfClosed = (xml[sdEnd - 1] == '/');
+    std::string inner;
+    if (sdSelfClosed) {
+        rs.suffix = xml.substr(sdEnd + 1);
+    } else {
+        const std::size_t close = xml.find("</sheetData>", sdEnd);
+        if (close == std::string::npos)
+            return rs;
+        inner = xml.substr(sdEnd + 1, close - (sdEnd + 1));
+        rs.suffix = xml.substr(close + 12);  // strlen("</sheetData>")
     }
 
-    if (!rid.empty()) {
-        std::string target;
-        p = 0;
+    std::size_t p = 0;
+    int autoRow = 0;
+    while (true) {
+        const std::size_t r = inner.find("<row", p);
+        if (r == std::string::npos)
+            break;
+        const char nc = (r + 4 < inner.size()) ? inner[r + 4] : '\0';
+        if (!(nc == ' ' || nc == '>' || nc == '/' || nc == '\t' ||
+              nc == '\n' || nc == '\r')) {
+            p = r + 4;
+            continue;
+        }
+        const std::size_t tagEnd = inner.find('>', r);
+        if (tagEnd == std::string::npos)
+            break;
+        const bool rowSelf = (inner[tagEnd - 1] == '/');
+        std::size_t next;
+        std::string rowInner;
+        if (rowSelf) {
+            next = tagEnd + 1;
+        } else {
+            const std::size_t rowEnd = inner.find("</row>", tagEnd);
+            if (rowEnd == std::string::npos)
+                break;
+            rowInner = inner.substr(tagEnd + 1, rowEnd - (tagEnd + 1));
+            next = rowEnd + 6;
+        }
+        const std::string openTag = inner.substr(r, tagEnd - r + 1);
+
+        int rowNum = autoRow + 1;
+        const std::string num = getAttr(openTag, "r");
+        if (!num.empty()) {
+            try {
+                rowNum = std::stoi(num);
+            } catch (...) {
+            }
+        }
+        autoRow = rowNum;
+
+        RawRow rr;
+        rr.openTag = openTag;
+        rr.selfClosed = rowSelf;
+        if (!rowSelf) {
+            std::size_t cp = 0;
+            while (true) {
+                const std::size_t c = findCellStart(rowInner, cp);
+                if (c == std::string::npos)
+                    break;
+                const std::size_t cTagEnd = rowInner.find('>', c);
+                if (cTagEnd == std::string::npos)
+                    break;
+                std::size_t cEnd, cNext;
+                if (cTagEnd > c && rowInner[cTagEnd - 1] == '/') {
+                    cEnd = cTagEnd + 1;
+                    cNext = cTagEnd + 1;
+                } else {
+                    const std::size_t cClose = rowInner.find("</c>", cTagEnd);
+                    if (cClose == std::string::npos)
+                        break;
+                    cEnd = cClose + 4;
+                    cNext = cEnd;
+                }
+                const std::string rawCell = rowInner.substr(c, cEnd - c);
+                cp = cNext;
+
+                const std::string ref = getAttr(rawCell, "r");
+                int rrow = 0, ccol = 0;
+                if (ref.empty() || !parseRef(ref, rrow, ccol))
+                    continue;
+                RawCell rc;
+                rc.raw = rawCell;
+                rc.value = decodeCell(rawCell, shared);
+                rr.cells[ccol] = rc;
+            }
+        }
+        rs.rows[rowNum] = rr;
+        p = next;
+    }
+    return rs;
+}
+
+std::string serializeRows(const std::map<int, RawRow>& rows) {
+    std::string out;
+    for (const auto& kv : rows) {
+        const int num = kv.first;
+        const RawRow& r = kv.second;
+        std::string cellsXml;
+        for (const auto& c : r.cells)
+            cellsXml += c.second.raw;
+        if (r.openTag.empty()) {
+            out += "<row r=\"" + std::to_string(num) + "\">" + cellsXml +
+                   "</row>";
+        } else if (r.selfClosed && cellsXml.empty()) {
+            out += r.openTag;
+        } else {
+            std::string tag = r.openTag;
+            if (r.selfClosed)
+                tag = tag.substr(0, tag.size() - 2) + ">";
+            out += tag + cellsXml + "</row>";
+        }
+    }
+    return out;
+}
+
+// 在已有工作表 XML 上就地增补表头/数据，保留其余单元格与格式
+std::string patchSheetXml(const std::string& sheetXml,
+                          const std::vector<std::string>& shared,
+                          const std::vector<std::string>& headers,
+                          const std::vector<std::vector<double>>& columns) {
+    RawSheet rs = parseRawSheet(sheetXml, shared);
+    if (!rs.hasSheetData) {
+        // 无 sheetData：退化为重建一张最小工作表
+        std::string s =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/"
+            "spreadsheetml/2006/main\"><sheetData>";
+        s += "<row r=\"1\">";
+        for (std::size_t i = 0; i < headers.size(); ++i)
+            s += "<c r=\"" + colName(static_cast<int>(i) + 1) +
+                 "1\" t=\"inlineStr\"><is><t>" + escapeXml(headers[i]) +
+                 "</t></is></c>";
+        s += "</row>";
+        const std::size_t rows = columns.empty() ? 0 : columns[0].size();
+        for (std::size_t r = 0; r < rows; ++r) {
+            s += "<row r=\"" + std::to_string(r + 2) + "\">";
+            for (std::size_t i = 0; i < headers.size(); ++i)
+                s += "<c r=\"" + colName(static_cast<int>(i) + 1) +
+                     std::to_string(r + 2) + "\"><v>" +
+                     formatNumber(columns[i][r]) + "</v></c>";
+            s += "</row>";
+        }
+        s += "</sheetData></worksheet>";
+        return s;
+    }
+
+    // 表头行：出现任一目标表头名的行；都没有则用第 1 行
+    int headerRow = 1;
+    bool found = false;
+    for (const auto& rk : rs.rows) {
+        for (const auto& ck : rk.second.cells) {
+            const Cell& cell = ck.second.value;
+            if (!cell.isString)
+                continue;
+            for (const std::string& h : headers)
+                if (cell.text == h) {
+                    headerRow = rk.first;
+                    found = true;
+                    break;
+                }
+            if (found)
+                break;
+        }
+        if (found)
+            break;
+    }
+
+    auto headerIt = rs.rows.find(headerRow);
+    int maxHeaderCol = 0;
+    if (headerIt != rs.rows.end() && !headerIt->second.cells.empty())
+        maxHeaderCol = headerIt->second.cells.rbegin()->first;
+
+    // 定位/新建目标列
+    std::vector<int> targetCols(headers.size(), 0);
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        int col = -1;
+        if (headerIt != rs.rows.end()) {
+            for (const auto& ck : headerIt->second.cells)
+                if (ck.second.value.isString &&
+                    ck.second.value.text == headers[i]) {
+                    col = ck.first;
+                    break;
+                }
+        }
+        if (col < 0) {
+            col = ++maxHeaderCol;
+            RawCell rc;
+            rc.raw = "<c r=\"" + colName(col) + std::to_string(headerRow) +
+                     "\" t=\"inlineStr\"><is><t>" + escapeXml(headers[i]) +
+                     "</t></is></c>";
+            rc.value.hasValue = true;
+            rc.value.isString = true;
+            rc.value.text = headers[i];
+            rs.rows[headerRow].cells[col] = rc;
+        }
+        targetCols[i] = col;
+    }
+
+    // 公共起始行 = 各目标列已有数据末行最大值 + 1(下界为表头行+1)
+    int startRow = headerRow + 1;
+    for (int col : targetCols) {
+        for (const auto& rk : rs.rows) {
+            if (rk.first <= headerRow)
+                continue;
+            const auto it = rk.second.cells.find(col);
+            if (it != rk.second.cells.end() && it->second.value.hasValue &&
+                rk.first + 1 > startRow)
+                startRow = rk.first + 1;
+        }
+    }
+
+    // 追加写入数据
+    const std::size_t rows = columns.empty() ? 0 : columns[0].size();
+    for (std::size_t r = 0; r < rows; ++r) {
+        const int rowNum = startRow + static_cast<int>(r);
+        for (std::size_t i = 0; i < headers.size(); ++i) {
+            RawCell rc;
+            rc.raw = "<c r=\"" + colName(targetCols[i]) +
+                     std::to_string(rowNum) + "\"><v>" +
+                     formatNumber(columns[i][r]) + "</v></c>";
+            rc.value.hasValue = true;
+            rc.value.isString = false;
+            rc.value.number = columns[i][r];
+            rs.rows[rowNum].cells[targetCols[i]] = rc;
+        }
+    }
+
+    return rs.prefix + "<sheetData>" + serializeRows(rs.rows) +
+           "</sheetData>" + rs.suffix;
+}
+
+// 在包的 workbook / rels / content-types 中登记一张新工作表
+void registerSheet(std::vector<OutPart>& parts, const std::string& wb,
+                   const std::string& rels, const std::string& ct,
+                   const std::string& sheetName,
+                   const std::string& sheetPath) {
+    int maxSheetId = 0;
+    {
+        std::size_t q = 0;
         for (;;) {
-            const std::size_t s = rels.find("<Relationship ", p);
+            std::size_t s = wb.find("sheetId=\"", q);
             if (s == std::string::npos)
                 break;
-            const std::size_t e = rels.find('>', s);
-            if (e == std::string::npos)
-                break;
-            const std::string el = rels.substr(s, e - s);
-            if (getAttr(el, "Id") == rid) {
-                target = getAttr(el, "Target");
-                break;
+            s += 9;
+            const std::size_t e = wb.find('"', s);
+            try {
+                maxSheetId =
+                    std::max(maxSheetId, std::stoi(wb.substr(s, e - s)));
+            } catch (...) {
             }
-            p = e + 1;
-        }
-        if (target.empty())
-            throw std::runtime_error("relationship missing for sheet");
-        const std::string path =
-            (target[0] == '/') ? target.substr(1) : "xl/" + target;
-        auto it = findPart(parts, path);
-        if (it == parts.end())
-            parts.emplace_back(path, toBytes(sheetXml));
-        else
-            it->second = toBytes(sheetXml);
-        return;
-    }
-
-    int maxSheet = 0;
-    const std::string pre = "xl/worksheets/sheet";
-    const std::string suf = ".xml";
-    for (const auto& part : parts) {
-        if (part.first.rfind(pre, 0) == 0 &&
-            part.first.size() > pre.size() + suf.size() &&
-            part.first.compare(part.first.size() - suf.size(), suf.size(),
-                               suf) == 0) {
-            const std::string num =
-                part.first.substr(pre.size(),
-                                  part.first.size() - pre.size() - suf.size());
-            bool digits = !num.empty();
-            for (const char ch : num)
-                if (!(ch >= '0' && ch <= '9'))
-                    digits = false;
-            if (digits)
-                maxSheet = std::max(maxSheet, std::stoi(num));
+            q = e + 1;
         }
     }
-    const int newSheet = maxSheet + 1;
-    const std::string newPath =
-        "xl/worksheets/sheet" + std::to_string(newSheet) + ".xml";
+    const int newSheetId = maxSheetId + 1;
 
     int maxRid = 0;
     for (const std::string& src : {wb, rels}) {
@@ -902,51 +1332,34 @@ void upsertSheet(PartList& parts, const std::string& sheetName,
     }
     const std::string newRid = "rId" + std::to_string(maxRid + 1);
 
-    int maxSheetId = 0;
-    {
-        std::size_t q = 0;
-        for (;;) {
-            std::size_t s = wb.find("sheetId=\"", q);
-            if (s == std::string::npos)
-                break;
-            s += 9;
-            const std::size_t e = wb.find('"', s);
-            maxSheetId = std::max(maxSheetId, std::stoi(wb.substr(s, e - s)));
-            q = e + 1;
-        }
-    }
-    const int newSheetId = maxSheetId + 1;
-
     std::string newWb = wb;
     const std::size_t sp = newWb.find("</sheets>");
-    const std::string sheetEl = "<sheet name=\"" + escapeXml(sheetName) +
-                                "\" sheetId=\"" + std::to_string(newSheetId) +
-                                "\" r:id=\"" + newRid + "\"/>";
-    newWb.insert(sp, sheetEl);
-    wbIt->second = toBytes(newWb);
+    newWb.insert(sp, "<sheet name=\"" + escapeXml(sheetName) +
+                         "\" sheetId=\"" + std::to_string(newSheetId) +
+                         "\" r:id=\"" + newRid + "\"/>");
+    replacePart(parts, "xl/workbook.xml",
+                makeDeflated("xl/workbook.xml", newWb));
 
     std::string newRels = rels;
     const std::size_t rp = newRels.find("</Relationships>");
-    const std::string relEl =
-        "<Relationship Id=\"" + newRid +
-        "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/"
-        "relationships/worksheet\" Target=\"worksheets/sheet" +
-        std::to_string(newSheet) + ".xml\"/>";
-    newRels.insert(rp, relEl);
-    relIt->second = toBytes(newRels);
+    newRels.insert(rp, "<Relationship Id=\"" + newRid +
+                           "\" Type=\"http://schemas.openxmlformats.org/"
+                           "officeDocument/2006/relationships/worksheet\" "
+                           "Target=\"" +
+                           sheetPath.substr(3) + "\"/>");
+    replacePart(parts, "xl/_rels/workbook.xml.rels",
+                makeDeflated("xl/_rels/workbook.xml.rels", newRels));
 
-    if (ctIt != parts.end()) {
-        std::string ct = toString(ctIt->second);
-        const std::size_t cp = ct.find("</Types>");
-        const std::string ov = "<Override PartName=\"/" + newPath +
-                               "\" ContentType=\"application/vnd."
-                               "openxmlformats-officedocument.spreadsheetml."
-                               "worksheet+xml\"/>";
-        ct.insert(cp, ov);
-        ctIt->second = toBytes(ct);
+    if (!ct.empty()) {
+        std::string newCt = ct;
+        const std::size_t cp = newCt.find("</Types>");
+        newCt.insert(cp, "<Override PartName=\"/" + sheetPath +
+                             "\" ContentType=\"application/vnd."
+                             "openxmlformats-officedocument.spreadsheetml."
+                             "worksheet+xml\"/>");
+        replacePart(parts, "[Content_Types].xml",
+                    makeDeflated("[Content_Types].xml", newCt));
     }
-
-    parts.emplace_back(newPath, toBytes(sheetXml));
 }
 
 }  // namespace
@@ -1018,22 +1431,137 @@ void writeColumnsToXlsx(const std::string& path,
     if (headers.size() != columns.size())
         throw std::runtime_error("headers and columns size mismatch");
 
-    const std::string sheetXml = buildSheetXml(headers, columns);
+    // 各数据列长度必须一致
+    for (std::size_t i = 1; i < columns.size(); ++i)
+        if (columns[i].size() != columns[0].size())
+            throw std::runtime_error(
+                "all data columns must have the same size");
 
-    PartList parts;
-    bool loaded = false;
+    // 读取整个包：未修改的部件保留原始压缩字节，仅在需要时解压(W1)
+    std::vector<OutPart> parts;
+    std::vector<uint8_t> data;
+    std::vector<ZipEntry> entries;
+    std::string workbookText, relsText, ctText;
+    std::string targetPath;
+    bool readable = false;
+    bool sheetExists = false;
+
     try {
-        const std::vector<uint8_t> data = readFile(path);
-        const std::vector<ZipEntry> entries = readCentralDirectory(data);
-        for (const auto& e : entries)
-            parts.emplace_back(e.name, extractEntry(data, e));
-        loaded = true;
+        data = readFile(path);
+        entries = readCentralDirectory(data);
+        parts.reserve(entries.size() + 2);
+        for (const auto& e : entries) {
+            OutPart p;
+            p.name = e.name;
+            p.method = e.method;
+            p.crc = e.crc;
+            p.compSize = e.compSize;
+            p.uncompSize = e.uncompSize;
+            try {
+                p.data = rawEntryBytes(data, e);  // 原样保留，不解压
+            } catch (...) {
+                // 本地头不可用时退回解压后按 stored 写
+                p.data = extractEntry(data, e);
+                p.method = 0;
+                p.uncompSize = static_cast<uint32_t>(p.data.size());
+                p.compSize = p.uncompSize;
+                p.crc = crc32(p.data.data(), p.data.size());
+            }
+            if (e.name == "xl/workbook.xml")
+                workbookText = partText(p);
+            else if (e.name == "xl/_rels/workbook.xml.rels")
+                relsText = partText(p);
+            else if (e.name == "[Content_Types].xml")
+                ctText = partText(p);
+            parts.push_back(std::move(p));
+        }
+        readable = !workbookText.empty();
+        if (readable) {
+            try {
+                targetPath = resolveSheetPath(data, entries, sheetName);
+                sheetExists = true;
+            } catch (...) {
+                sheetExists = false;
+            }
+        }
     } catch (...) {
-        loaded = false;
+        parts.clear();
+        readable = false;
     }
-    if (!loaded)
-        parts = buildEmptyPackage();
 
-    upsertSheet(parts, sheetName, sheetXml);
+    if (!readable) {
+        parts = buildEmptyPackage();
+        for (const auto& p : parts) {
+            if (p.name == "xl/workbook.xml")
+                workbookText = partText(p);
+            else if (p.name == "xl/_rels/workbook.xml.rels")
+                relsText = partText(p);
+            else if (p.name == "[Content_Types].xml")
+                ctText = partText(p);
+        }
+        sheetExists = false;
+    }
+
+    // 共享字符串(解读已有表头/单元格需要)
+    std::vector<std::string> shared;
+    for (const auto& p : parts)
+        if (p.name == "xl/sharedStrings.xml") {
+            try {
+                shared = parseSharedStrings(partText(p));
+            } catch (...) {
+            }
+            break;
+        }
+
+    // 取目标工作表 XML(存在时)，在内存中增量修补(C1)
+    std::string sheetXml;
+    if (sheetExists) {
+        try {
+            for (const auto& p : parts)
+                if (p.name == targetPath) {
+                    sheetXml = partText(p);
+                    break;
+                }
+        } catch (...) {
+            sheetXml.clear();
+        }
+    }
+
+    if (!sheetExists) {
+        // 分配新工作表路径
+        int maxSheet = 0;
+        const std::string pre = "xl/worksheets/sheet";
+        const std::string suf = ".xml";
+        for (const auto& p : parts) {
+            if (p.name.rfind(pre, 0) == 0 &&
+                p.name.size() > pre.size() + suf.size() &&
+                p.name.compare(p.name.size() - suf.size(), suf.size(),
+                               suf) == 0) {
+                const std::string num = p.name.substr(
+                    pre.size(), p.name.size() - pre.size() - suf.size());
+                bool digits = !num.empty();
+                for (const char ch : num)
+                    if (!(ch >= '0' && ch <= '9'))
+                        digits = false;
+                if (digits)
+                    maxSheet = std::max(maxSheet, std::stoi(num));
+            }
+        }
+        targetPath =
+            "xl/worksheets/sheet" + std::to_string(maxSheet + 1) + ".xml";
+    }
+
+    const std::string patched =
+        patchSheetXml(sheetXml, shared, headers, columns);
+    const OutPart sheetPart = makeDeflated(targetPath, patched);
+
+    if (sheetExists) {
+        replacePart(parts, targetPath, sheetPart);
+    } else {
+        parts.push_back(sheetPart);
+        registerSheet(parts, workbookText, relsText, ctText, sheetName,
+                      targetPath);
+    }
+
     writeZip(path, parts);
 }
