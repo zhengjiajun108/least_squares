@@ -1,8 +1,8 @@
 // 联合优化和分布优化操作封装函数
-#include "LineFitPipeline.h"
+#include "pipeline/LineFitPipeline.h"
 
-#include "XlsxReader.h"
-#include "SortUtils.h"
+#include "utils/XlsxReader.h"
+#include "utils/SortUtils.h"
 
 #include <iostream>
 #include <stdexcept>

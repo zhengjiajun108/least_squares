@@ -1,7 +1,7 @@
 #ifndef LINE_FIT_PIPELINE_H
 #define LINE_FIT_PIPELINE_H
 
-#include "LineFit.h"
+#include "core/LineFit.h"
 
 #include <cstddef>
 #include <string>

@@ -1,7 +1,7 @@
 #ifndef PLANE_FIT_PIPELINE_H
 #define PLANE_FIT_PIPELINE_H
 
-#include "SvdPlaneFit.h"
+#include "core/PlaneFit.h"
 
 #include <string>
 
